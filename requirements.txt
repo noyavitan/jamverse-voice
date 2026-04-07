@@ -3,3 +3,7 @@ sounddevice==0.5.1
 numpy>=1.26,<2.2
 soxr==0.5.0
 python-osc==1.9.0
+python_speech_features==0.6
+scipy>=1.11
+fastdtw==0.3.4
+textual==0.83.0

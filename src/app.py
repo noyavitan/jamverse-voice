@@ -1,17 +1,18 @@
-"""Orchestrator: opens audio device, runs Vosk, prints to terminal, optionally sends OSC."""
-import queue
+"""Headless mode: interactive device picker → live terminal transcription.
+This is what Jamverse will launch as a child process (no TUI).
+"""
 import sys
-import numpy as np
-import sounddevice as sd
-import soxr
+import threading
+from pathlib import Path
 
-from . import config
 from .audio.device_picker import pick_device, print_devices
-from .engines.vosk_engine import VoskEngine
-from .grammar.music_vocab import build_grammar
-from .parser.command_parser import parse
+from .core.runner import EngineRunner
+from .core.events import (
+    Event, PartialEvent, FinalEvent, OscOutEvent, KeywordHitEvent, StatusEvent,
+)
 from .output.terminal import TerminalPrinter
-from .output.osc_sender import OscSender
+
+KEYWORDS_DIR = Path(__file__).resolve().parent.parent / "keywords"
 
 
 def run(use_osc: bool = False, use_grammar: bool = True, list_only: bool = False) -> int:
@@ -20,86 +21,47 @@ def run(use_osc: bool = False, use_grammar: bool = True, list_only: bool = False
         return 0
 
     printer = TerminalPrinter()
-    printer.info("\n=== Jamverse STT POC (Vosk) ===")
+    printer.info("\n=== Jamverse Voice (headless) ===")
 
-    choice = pick_device()
+    device = pick_device()
     printer.info(
-        f"\nUsing: [{choice.device_index}] {choice.device_name} "
-        f"(channel {choice.channel_index + 1}/{choice.open_channels} @ {choice.samplerate} Hz)"
+        f"\nUsing: [{device.device_index}] {device.device_name} "
+        f"(channel {device.channel_index + 1}/{device.open_channels} @ {device.samplerate} Hz)"
     )
-
-    grammar = build_grammar() if use_grammar else None
-    if use_grammar:
-        printer.info(f"Grammar: {len(grammar)} tokens (chords + transport + numbers)")
-
-    engine = VoskEngine(config.MODEL_DIR, samplerate=config.TARGET_SAMPLE_RATE, grammar=grammar)
-
-    osc: OscSender | None = None
-    if use_osc:
-        osc = OscSender()
-        printer.info(f"OSC: sending to {osc.endpoint}")
-    else:
-        printer.info("OSC: disabled (pass --osc to enable)")
-
+    printer.info(f"OSC: {'enabled (:9100 /stt/*)' if use_osc else 'disabled (pass --osc to enable)'}")
+    if KEYWORDS_DIR.exists() and any(KEYWORDS_DIR.iterdir()):
+        printer.info(f"Keywords: loaded from {KEYWORDS_DIR}")
     printer.info("\nSpeak now. Ctrl+C to quit.\n")
 
-    audio_q: queue.Queue[np.ndarray] = queue.Queue()
-    blocksize = int(choice.samplerate * config.BLOCK_MS / 1000)
+    stop = threading.Event()
 
-    def callback(indata, frames, time_info, status):
-        if status:
-            # underflow/overflow — print but keep going
-            sys.stderr.write(f"[audio] {status}\n")
-        # take the chosen channel as a mono float32 view
-        mono = indata[:, choice.channel_index].astype(np.float32, copy=False)
-        audio_q.put(mono.copy())
+    def on_event(event: Event) -> None:
+        if isinstance(event, PartialEvent):
+            printer.partial(event.text)
+        elif isinstance(event, FinalEvent):
+            cmd_repr = f"{event.command.type}:{event.command.value}" if event.command else ""
+            printer.final(event.text, cmd_repr)
+        elif isinstance(event, KeywordHitEvent):
+            printer.final(f"★ keyword: {event.name}", f"score:{event.score:.2f}")
+        elif isinstance(event, OscOutEvent):
+            pass  # silent in headless mode (Jamverse receives it on the wire)
+        elif isinstance(event, StatusEvent) and event.kind != "info":
+            printer.info(f"[{event.kind}] {event.message}")
 
+    runner = EngineRunner(on_event=on_event)
     try:
-        with sd.InputStream(
-            device=choice.device_index,
-            channels=choice.open_channels,
-            samplerate=choice.samplerate,
-            blocksize=blocksize,
-            dtype="float32",
-            callback=callback,
-        ):
-            _consume(audio_q, engine, choice.samplerate, printer, osc)
+        runner.start(
+            device,
+            use_grammar=use_grammar,
+            use_osc=use_osc,
+            keywords_dir=KEYWORDS_DIR,
+        )
+        stop.wait()  # blocks until KeyboardInterrupt
     except KeyboardInterrupt:
         printer.info("\nbye.")
-        return 0
     except Exception as e:
         sys.stderr.write(f"\nfatal: {e}\n")
         return 1
+    finally:
+        runner.stop()
     return 0
-
-
-def _consume(audio_q, engine, src_sr, printer, osc):
-    """Pull audio blocks, resample to 16k, feed engine, dispatch results."""
-    target_sr = 16000
-    resampler = soxr.ResampleStream(
-        in_rate=src_sr, out_rate=target_sr, num_channels=1, dtype="float32"
-    )
-    while True:
-        block = audio_q.get()
-        if src_sr != target_sr:
-            resampled = resampler.resample_chunk(block)
-        else:
-            resampled = block
-        if resampled.size == 0:
-            continue
-        # float32 [-1,1] -> int16 PCM bytes
-        pcm = np.clip(resampled * 32767.0, -32768, 32767).astype(np.int16).tobytes()
-
-        hyp = engine.feed(pcm)
-        if hyp is None:
-            continue
-        if hyp.is_final:
-            cmd = parse(hyp.text)
-            cmd_repr = f"{cmd.type}:{cmd.value}" if cmd else ""
-            printer.final(hyp.text, cmd_repr)
-            if osc and cmd:
-                osc.send_command(cmd)
-        else:
-            printer.partial(hyp.text)
-            if osc:
-                osc.send_partial(hyp.text)

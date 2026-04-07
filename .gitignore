@@ -10,6 +10,10 @@ venv/
 models/
 !models/.gitkeep
 
+# User-recorded keyword samples (root-level only — not src/keywords/!)
+/keywords/
+!/keywords/.gitkeep
+
 # OS
 .DS_Store
 Thumbs.db

@@ -34,15 +34,32 @@ Requires Python 3.11 (Vosk doesn't have wheels for 3.13/3.14 yet).
 
 ## Usage
 
+### Headless mode (what Jamverse will launch)
 ```bash
-./run.sh                 # pick a device, start transcribing
-./run.sh --list          # list input devices and exit
-./run.sh --osc           # also forward commands over OSC
-./run.sh --no-grammar    # disable music vocab biasing (open dictation)
+./run.sh                       # pick a device, start transcribing
+./run.sh --list                # list input devices and exit
+./run.sh --osc                 # also forward commands over OSC :9100
+./run.sh --no-grammar          # disable music vocab biasing
 ```
 
-You'll be prompted to pick an input device (MacBook mic, audio interface,
-BlackHole, etc.) and — for multi-channel devices — which channel to read.
+### Developer TUI (Textual)
+```bash
+./run.sh dev                   # multi-pane dev console
+./run.sh dev --osc             # TUI with OSC forwarding on at startup
+```
+
+Keybindings inside the TUI: `[o]` toggle OSC · `[k]` capture custom keyword
+· `[c]` clear OSC log · `[q]` quit
+
+### Custom keywords (any sound, including gibberish)
+```bash
+./run.sh capture wakeup        # record 4 samples of "wakeup" (or any sound)
+./run.sh capture blarghnix     # gibberish works — uses MFCC + DTW pattern matching
+./run.sh keywords              # list saved keywords
+./run.sh keywords delete wakeup
+```
+Captured keywords are auto-detected by both headless and TUI modes alongside
+the normal grammar. Hits emit `/stt/keyword [name, score]`.
 
 ## Output format
 
@@ -64,28 +81,49 @@ BlackHole, etc.) and — for multi-channel devices — which channel to read.
 | `one two three`   | `/stt/count`     | `[1, 2, 3]`     |
 | `bass` / `drums`  | `/stt/instrument`| `["bass"]`      |
 | live partials     | `/stt/partial`   | `[text]`        |
+| custom keyword hit| `/stt/keyword`   | `["wakeup", 0.92]` |
 
 ## Project layout
 
 ```
 speech-to-text-poc/
-├── main.py                     # entry point (argparse)
+├── main.py                     # entry point with subcommands
 ├── setup.sh / run.sh / download_model.sh
 ├── requirements.txt
-├── models/                     # Vosk model lives here
+├── models/                     # Vosk model (gitignored)
+├── keywords/                   # user-recorded custom keywords (gitignored)
 └── src/
     ├── config.py               # ports, sample rates, model path
-    ├── app.py                  # orchestrator
+    ├── app.py                  # headless orchestrator (what Jamverse launches)
+    ├── core/
+    │   ├── events.py           # PartialEvent, FinalEvent, OscOutEvent, KeywordHitEvent, ...
+    │   └── runner.py           # EngineRunner — owns audio + Vosk + detector + OSC
     ├── audio/device_picker.py  # interactive device + channel selection
     ├── engines/
-    │   ├── base.py             # SpeechEngine ABC (Whisper/Moonshine swap-in ready)
+    │   ├── base.py             # SpeechEngine ABC (swap to Moonshine/whisper.cpp later)
     │   └── vosk_engine.py
-    ├── grammar/music_vocab.py  # chord/transport/number tokens
+    ├── grammar/
+    │   ├── music_vocab.py      # chord/transport/number/BPM tokens
+    │   └── styles.py           # ~80 musical styles
     ├── parser/command_parser.py # text → structured Command
-    └── output/
-        ├── terminal.py         # live partial/final printer
-        └── osc_sender.py       # /stt/* sender
+    ├── keywords/               # custom-keyword detection (any sound, including gibberish)
+    │   ├── features.py         # MFCC extraction
+    │   ├── store.py            # WAV samples + meta on disk
+    │   ├── detector.py         # sliding-window DTW matcher
+    │   ├── capture.py          # record-N-samples flow with auto-threshold
+    │   └── cli.py              # capture / list / delete subcommands
+    ├── output/
+    │   ├── terminal.py         # live partial/final printer (headless)
+    │   └── osc_sender.py       # /stt/* sender
+    └── tui/                    # Textual developer console (dev-only, not shipped)
+        ├── app.py              # JamverseVoiceTUI
+        ├── widgets.py          # transcript / OSC log / keywords / stats / status bar
+        └── modals.py           # capture-keyword modal
 ```
+
+**Same engine, two front-ends:** `core/runner.py` is the engine; both
+`src/app.py` (headless) and `src/tui/app.py` (TUI) consume the same event
+stream. Production Jamverse launches headless mode — the TUI never ships.
 
 ## Porting to Jamverse later
 
